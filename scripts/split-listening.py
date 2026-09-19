@@ -158,7 +158,10 @@ def find_repeat_pairs(x, chunks, tol_abs=0.10, tol_rel=0.04, min_chunks=2, min_t
             if i > 0 and j > 0 and close(durs[i - 1], durs[j - 1]):
                 continue
             k = match_len(i, j)
-            if k >= min_chunks and sum(durs[i:i + k]) >= min_total:
+            tot = sum(durs[i:i + k])
+            # single-chunk matches allowed only for long chunks (material with no
+            # internal silence is one chunk per play)
+            if tot >= min_total and (k >= min_chunks or (k == 1 and tot >= 8.0)):
                 cands.append((i, j, k))
     cands.sort(key=lambda m: -sum(durs[m[0]:m[0] + m[2]]))
     used = [False] * n
@@ -179,12 +182,31 @@ def find_repeat_pairs(x, chunks, tol_abs=0.10, tol_rel=0.04, min_chunks=2, min_t
     confirmed.sort()
     return confirmed
 
+def merge_pair_fragments(chunks, pairs):
+    """merge fragment pairs of the same play-pair: same time shift (p2-p1) and
+    adjacent on both sides (silence splitting may differ between the two plays)"""
+    merged = []
+    for p in sorted(pairs, key=lambda t: t[0]):
+        i1, j1, i2, j2 = p
+        if merged:
+            m = merged[-1]
+            shift_p = chunks[j1][0] - chunks[i1][0]
+            shift_m = chunks[m[1]][0] - chunks[m[0]][0]
+            if (i1 - m[2] <= 2 and j1 - m[3] <= 2 and i1 >= m[0] and j1 >= m[1]
+                    and abs(shift_p - shift_m) < 2.0):
+                m[2] = max(m[2], i2)
+                m[3] = max(m[3], j2)
+                continue
+        merged.append([i1, j1, i2, j2])
+    return [tuple(m) for m in merged]
+
 # ---------- assemble materials ----------
 
 def extract_materials(chunks, markers, pairs):
     """exam format: section 1 = 5 single-play texts, section 2 = 5 double-played texts"""
     marker_set = set(markers)
     notes = []
+    pairs = merge_pair_fragments(chunks, pairs)
 
     mat_pairs, disc = [], []
     for i1, j1, i2, j2 in pairs:
