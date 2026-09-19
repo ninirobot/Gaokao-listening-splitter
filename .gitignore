@@ -1,0 +1,9 @@
+# Kilo 配置与计划文件
+.kilo/
+
+# Python
+__pycache__/
+*.pyc
+
+# 切分输出
+*-切分结果/
