@@ -7,7 +7,7 @@
 
 输出: 每个 MP3 旁边生成 <原名>-切分结果/ 文件夹 (D01-D10.mp3 + timeline.json)
 """
-import re, subprocess, sys, json, os, glob, shutil
+import re, subprocess, sys, json, os, glob, shutil, time
 import numpy as np
 
 SR = 8000
@@ -182,6 +182,52 @@ def find_repeat_pairs(x, chunks, tol_abs=0.10, tol_rel=0.04, min_chunks=2, min_t
     confirmed.sort()
     return confirmed
 
+def _match_runs(x, chunks, ci, cj):
+    """find (m, k) such that chunks[ci:ci+m] and chunks[cj:cj+k] are the same
+    recording (tolerates silence-split differences: 1 chunk vs several)"""
+    for m, k in ((1, 1), (1, 2), (2, 1), (1, 3), (3, 1), (2, 2)):
+        if ci + m > len(chunks) or cj + k > len(chunks):
+            continue
+        a0, a1 = chunks[ci][0], chunks[ci + m - 1][1]
+        b0, b1 = chunks[cj][0], chunks[cj + k - 1][1]
+        if abs((a1 - a0) - (b1 - b0)) > 1.5:
+            continue
+        if xcorr_best(seg(x, a0, a1), seg(x, b0, b1)) > 0.75:
+            return m, k
+    return None
+
+def extend_pair_ends(x, chunks, marker_set, pairs, max_rounds=4):
+    """extend each pair's boundaries while adjacent audio is the same recording;
+    guards: no markers, gap <= 2s on both sides, p1 stays before p2"""
+    out = []
+    for i1, j1, i2, j2 in pairs:
+        # forward
+        for _ in range(max_rounds):
+            if i2 >= j1 or j2 >= len(chunks) or i2 in marker_set or j2 in marker_set:
+                break
+            if (chunks[i2][0] - chunks[i2 - 1][1] > 2.0
+                    or chunks[j2][0] - chunks[j2 - 1][1] > 2.0):
+                break
+            mk_ = _match_runs(x, chunks, i2, j2)
+            if mk_ is None or i2 + mk_[0] > j1:
+                break
+            i2 += mk_[0]
+            j2 += mk_[1]
+        # backward
+        for _ in range(max_rounds):
+            if i1 <= 0 or j1 <= 0 or i1 - 1 in marker_set or j1 - 1 in marker_set:
+                break
+            if (chunks[i1][0] - chunks[i1 - 1][1] > 2.0
+                    or chunks[j1][0] - chunks[j1 - 1][1] > 2.0):
+                break
+            mk_ = _match_runs(x, chunks, i1 - 1, j1 - 1)
+            if mk_ is None or j1 - mk_[1] <= i1 - mk_[0]:
+                break
+            i1 -= mk_[0]
+            j1 -= mk_[1]
+        out.append((i1, j1, i2, j2))
+    return out
+
 def merge_pair_fragments(chunks, pairs):
     """merge fragment pairs of the same play-pair: same time shift (p2-p1) and
     adjacent on both sides (silence splitting may differ between the two plays)"""
@@ -202,10 +248,11 @@ def merge_pair_fragments(chunks, pairs):
 
 # ---------- assemble materials ----------
 
-def extract_materials(chunks, markers, pairs):
+def extract_materials(x, chunks, markers, pairs):
     """exam format: section 1 = 5 single-play texts, section 2 = 5 double-played texts"""
     marker_set = set(markers)
     notes = []
+    pairs = extend_pair_ends(x, chunks, marker_set, pairs)
     pairs = merge_pair_fragments(chunks, pairs)
 
     mat_pairs, disc = [], []
@@ -286,11 +333,17 @@ def cut(src, start, end, out, pad_in=0.10, pad_out=0.35):
                     "-af", "afade=t=in:st=0:d=0.10", "-c:a", "libmp3lame", "-b:a", "128k", out],
                    check=True)
 
-def max_volume(path):
-    r = subprocess.run([FF, "-hide_banner", "-i", path, "-af", "volumedetect", "-f", "null", "-"],
-                       capture_output=True, text=True, encoding="utf-8", errors="replace")
-    m = re.search(r"max_volume: ([-\d.]+) dB", r.stderr)
-    return float(m.group(1)) if m else -999.0
+def max_volume(path, retries=3):
+    """max volume in dB, or None if measurement failed (e.g. AV briefly locks
+    the just-written file on Windows)"""
+    for _ in range(retries):
+        r = subprocess.run([FF, "-hide_banner", "-i", path, "-af", "volumedetect", "-f", "null", "-"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        m = re.search(r"max_volume: ([-\d.]+) dB", r.stderr)
+        if m:
+            return float(m.group(1))
+        time.sleep(0.4)
+    return None
 
 # ---------- per-file processing ----------
 
@@ -301,7 +354,7 @@ def process(path, outdir):
     chunks = build_chunks(detect_silences_np(x), dur)
     markers = find_markers(x, chunks)
     pairs = find_repeat_pairs(x, chunks)
-    materials, mat_pairs, disc, labels, notes = extract_materials(chunks, markers, pairs)
+    materials, mat_pairs, disc, labels, notes = extract_materials(x, chunks, markers, pairs)
 
     print(f"  分析完成: {len(materials)} 段材料 "
           f"({sum(1 for m in materials if m['plays'] == 1)} 段播一遍 + "
@@ -327,10 +380,13 @@ def process(path, outdir):
         out = os.path.join(outdir, f"D{mt['n']:02d}.mp3")
         cut(path, mt["start"], mt["end"], out)
         vols.append(max_volume(out))
-    bad = [i + 1 for i, v in enumerate(vols) if v < -60]
+    bad = [i + 1 for i, v in enumerate(vols) if v is not None and v < -60]
+    unverified = [i + 1 for i, v in enumerate(vols) if v is None]
     if bad:
         print(f"    !! 第 {bad} 段切分后是静音, 请人工核对")
-    else:
+    if unverified:
+        print(f"    ? 第 {unverified} 段音量无法校验 (文件被占用), 可自行抽查")
+    if not bad and not unverified:
         print(f"    切分完成, 音量检查全部通过 (最低 {min(vols):.1f}dB)")
     print(f"    结果已保存到: {outdir}")
     return materials
