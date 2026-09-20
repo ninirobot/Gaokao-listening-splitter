@@ -7,3 +7,14 @@ __pycache__/
 
 # 切分输出
 *-切分结果/
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+
+# 回归跑数的临时快照（baseline-v1.json 保留，它是回归基准）
+result-*.json
+diag-check.json
+
+.codebuddy/
