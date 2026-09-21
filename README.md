@@ -244,6 +244,8 @@ python scripts-v4/split-listening-v4.py <文件或文件夹> [--no-pause] [--for
 
 ```
 README.md                      项目说明（原理、能力边界、更新日志）
+LICENSE                        Apache License 2.0 全文
+NOTICE                         版权与作者署名（再分发时必须随附）
 .gitignore
 听力切分-使用说明.txt           给使用者看的操作说明（发 Release 时一起附上）
 scripts-v4/
@@ -356,3 +358,20 @@ V1 在真实卷子上暴露的几个具体毛病，这一版逐个修掉：
 - 主程序同步改名为 `scripts-v4/split-listening-v4.py`、exe 改名 `听力切分-v4.exe`：
   这一版动的是判定本身（新增边界生长判据、新增一把独立于百分比的校验尺子），
   所以版本号从 v3 升到 v4。
+
+---
+
+## 九、版权与授权
+
+本工具由 ninirobot 开发，著作权归其所有，采用
+[**Apache License 2.0**](https://www.apache.org/licenses/LICENSE-2.0)
+（全文见 [LICENSE](LICENSE)，署名文件见 [NOTICE](NOTICE)）。
+
+个人和教学都可以免费用，随便用、随便改、随便转发。只有三条要求：
+
+- 再分发时（发 exe、发源码、放到任何地方供人下载）**必须带上 [LICENSE](LICENSE)
+  和 [NOTICE](NOTICE)**，里面有作者署名和项目主页，不能删改；
+- 改过源码再发出去的，注明改了哪些文件；
+- 不得用作者名义或项目名给自己的账号、课程、产品做背书宣传。
+
+不带署名的分发，不在授权范围内。

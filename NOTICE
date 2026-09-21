@@ -1,0 +1,16 @@
+高考英语听力自动切分工具（Gaokao Listening Splitter）
+Copyright 2026 ninirobot
+
+本项目由 ninirobot 独立开发，著作权归其单独所有。
+项目主页：https://github.com/ninirobot/Gaokao-listening-splitter
+
+本项目依据 Apache License, Version 2.0 授权，协议全文见同目录下的 LICENSE 文件，
+亦可从 http://www.apache.org/licenses/LICENSE-2.0 获取。
+
+按 Apache-2.0 第 4 条(d) 款的规定：任何再分发本软件（含 exe 等编译产物、源代码
+及其衍生版本）的行为，都必须随附一份本 NOTICE 文件的可读副本，并保留其中的
+版权与作者署名信息。
+
+按 Apache-2.0 第 6 条的规定：本许可不授予使用「ninirobot」名义或本项目名称
+进行背书、宣传的权利——不得以任何方式暗示本项目由他人开发、维护、授权或与他人
+存在合作关系。
