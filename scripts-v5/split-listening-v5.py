@@ -3,7 +3,7 @@
 用法（三选一）:
   1. 直接双击运行:  切分本文件(或exe)所在文件夹里的全部 MP3
   2. 把 MP3 拖到本程序图标上: 只切分拖入的文件
-  3. 命令行: python split-listening-v4.py <文件或文件夹> [--no-pause]
+  3. 命令行: python split-listening-v5.py <文件或文件夹> [--no-pause] [--diag]
 
 输出: 每个 MP3 旁边生成 <原名>-切分结果/ 文件夹 (D01-D10.mp3 + timeline.json)
 """
@@ -19,7 +19,43 @@ MIN_PAIR_SPEECH = 6.0         # 一段双遍材料的最短时长(秒)。第一�
 MARKER_SPECTRAL_MAX = 0.010   # 见 spectral_change 的说明与实测分布
 N_SINGLE = 5                  # 第一节：播一遍的材料数
 N_DOUBLE = 5                  # 第二节：播两遍的材料数（标准高考 5+5）
+
+# ---------- 对齐通道（帧级对数频带 + 带约束 DTW）----------
+# 上面那套波形判据的前提是「两遍是同一份音频、整段只差一个固定偏移」。出版方的制品
+# 常常不是：两遍之间会有拼接缝、0.1 秒尺度的抖动、小幅变速，甚至分两次朗读。对这种
+# 制品，整段波形残差必然虚高——实测同源两遍就有 1.17~1.45（高于 RESID_OK=0.35，
+# 138 个候选全被否，整卷崩掉）。这里补一条相位无关的对齐通道：把音频压成帧级对数
+# 频带，用带约束 DTW 求对齐，判据是「对齐路径的平均帧距」。
+# 实测（2026-09-22，高一 29 份 / 济南高三卷 / 美音2 / 检测卷5，见 .kilo/dev-tools/
+# ground-truth.json 的 calibration 与 dtw-probe.py）：
+#   同源两遍 0.486~1.192；不同材料两两交叉（每份 90 对）最小 2.902、中位 3.53。
+# 门限取 1.8（两侧各约 1.5 倍余量）；特征提取 0.10 秒/份、单次对齐 6~140 毫秒。
+# 只在波形判据失败时才计算，所以波形判得通的跨度结果与耗时不变。
+ALIGN_BANDS = 30      # 对数频带数（约 30~4000Hz）
+ALIGN_WIN = 256       # 特征窗长（32ms）
+ALIGN_HOP = 160       # 特征帧步（20ms，即 50 帧/秒）
+ALIGN_MIN = 8.0       # 对齐判定要求的最短跨度(秒)。门限只在 10~80 秒跨度上标定过
+ALIGN_DTW_MAX = 1.8   # 对齐通道判定门限（同源 ≤1.192、无关 ≥2.902）
+ALIGN_ENV_GATE = 0.6  # 便宜的包络预筛门限（同源 0.77~0.97、无关 ≤0.3）
+ALIGN_ENV_STEP = 0.05  # 预筛里搜偏移的步长(秒)：两遍起点可能错开 1 秒以上，不搜会误杀真配对
+ALIGN_RESID_OK = 1.0  # align 段的报数/告警门限：实测同源两遍对齐后残差 0.09~0.93
+                      # （短窗口径），无关内容 ≥1.1~1.4，取 1.0 落在两者之间
+ALIGN_BLOCK = 0.5     # 分段偏移块长(秒)：align 段把「整段一个 lag」换成分段 lag
+ALIGN_FIRST = 2.0     # 首块偏移搜索范围(秒)：两遍起点可能错开 1 秒以上
+ALIGN_FOLLOW = 0.35   # 后续块跟上一块走的搜索范围(秒)
+ALIGN_FINE = 0.010    # 特征给出的偏移再在波形上精修的范围(秒)
+ENV_FRAME = SR // 100  # 包络帧长（10ms），包络预筛用
 FF = None  # resolved ffmpeg binary
+DIAG = None  # --diag 时由 main() 设成 dict；非 None 时各环节往里旁路记录。
+             # 只写不读：记录本身绝不参与任何判定，关掉它与关掉前逐字一致。
+DIAG_DIR = None    # --diag=<目录> 给的目录；None 表示写到切分结果文件夹里
+DIAG_CAND_MAX = 200  # 配对候选只记前这么多条（按总长降序），免得 JSON 失控
+FEATS = None  # 帧级对数频带（每份音频只算一次）
+ENV = None    # 10ms RMS 包络（每份音频只算一次，对齐通道的便宜预筛）
+DTW_CACHE = {}      # (跨度1, 跨度2) -> 对齐距离
+OFFSET_CACHE = {}   # (跨度1, 跨度2) -> 分段局部偏移
+SPAN_RESID_CACHE = {}  # (跨度1, 跨度2) -> 短窗对齐残差（align 段的最终裁定口径）
+ALIGN_ON = False      # 本文件是否启用对齐通道；由 analyze_materials 按「波形通道够不够用」决定
 
 # ---------- ffmpeg resolution ----------
 
@@ -148,6 +184,299 @@ def xcorr_best(a, b, max_lag=SR // 4):
                 best = max(best, float((neg[m[good]] / np.sqrt(na2[good] * nb2[good])).max()))
     return best
 
+# ---------- alignment channel: frame features + constrained DTW ----------
+
+_ALIGN_FILT = None
+
+
+def _align_filters():
+    """对数频带滤波器组（ALIGN_BANDS 个，约 30~4000Hz）"""
+    fr = np.fft.rfftfreq(ALIGN_WIN, 1.0 / SR)
+    edges = np.unique(np.round(np.geomspace(2, len(fr) - 1, ALIGN_BANDS + 1)).astype(int))
+    m = np.zeros((len(edges) - 1, len(fr)), dtype=np.float32)
+    for k in range(len(edges) - 1):
+        m[k, edges[k]:edges[k + 1]] = 1.0
+    return m
+
+
+def build_feats(x):
+    """帧级对数频带（ALIGN_BANDS 个、ALIGN_WIN 窗、ALIGN_HOP 步），逐帧去均值除标准差。
+
+    这是对齐通道的输入：只留「频谱包络随时间怎么变」，丢掉采样级相位，所以拼接缝、
+    抖动、小幅变速、甚至重新朗读都打不散它（实测同源两遍 0.49~1.19、跨材料 ≥2.90）。
+    """
+    global _ALIGN_FILT
+    if _ALIGN_FILT is None:
+        _ALIGN_FILT = _align_filters()
+    n = (len(x) - ALIGN_WIN) // ALIGN_HOP
+    if n < 4:
+        return np.zeros((0, ALIGN_BANDS), dtype=np.float32)
+    w = np.hanning(ALIGN_WIN)
+    frames = np.lib.stride_tricks.sliding_window_view(x, ALIGN_WIN)[::ALIGN_HOP][:n] * w
+    spec = np.abs(np.fft.rfft(frames, axis=1)).astype(np.float32)
+    f = np.log1p((spec @ _ALIGN_FILT.T) * 50.0)
+    f -= f.mean(axis=1, keepdims=True)
+    f /= f.std(axis=1, keepdims=True) + 1e-6
+    return f.astype(np.float32)
+
+
+def _fidx(t):
+    return int(round(t * SR / ALIGN_HOP))
+
+
+def _span_feats(s, e):
+    if FEATS is None or len(FEATS) == 0:
+        return None
+    a, b = max(0, _fidx(s)), min(len(FEATS), _fidx(e))
+    return FEATS[a:b] if b - a >= 3 else None
+
+
+def dtw_dist(A, B):
+    """带约束 DTW：返回对齐代价 / (n+m)，越小越像；不可达返回 None。
+
+    band = max(|n-m|+5, 10%·max(n,m)+5) 帧（Sakoe-Chiba 带，容 ±10% 速度差）。
+    行内横向推进用 cumsum + 前缀最小向量化，避免 Python 逐格循环。
+    """
+    if A is None or B is None:
+        return None
+    n, m = len(A), len(B)
+    if n < 3 or m < 3:
+        return None
+    band = max(abs(n - m) + 5, int(0.10 * max(n, m)) + 5)
+    INF = np.float32(1e9)
+    prev = np.full(m + 2, INF, dtype=np.float32)
+    prev[1] = 0.0
+    idx_all = np.arange(m + 2)
+    for i in range(1, n + 1):
+        lo, hi = max(1, i - band), min(m, i + band)
+        d = np.sqrt(((B[lo - 1:hi] - A[i - 1]) ** 2).sum(axis=1)).astype(np.float32)
+        idx = idx_all[lo:hi + 1]
+        best = np.minimum(prev[idx - 1], prev[idx])
+        cum = np.cumsum(d, dtype=np.float64)
+        adj = best.astype(np.float64) - np.concatenate([[0.0], cum[:-1]])
+        cur = np.full(m + 2, INF, dtype=np.float32)
+        cur[lo:hi + 1] = (cum + np.minimum.accumulate(adj)).astype(np.float32)
+        prev = cur
+    v = prev[m]
+    return None if v >= INF / 2 else float(v) / (n + m)
+
+
+def align_dist(s1, e1, s2, e2, min_len=ALIGN_MIN):
+    """两段的对齐距离（带缓存）；跨度不足 min_len 秒返回 None。
+
+    门限 ALIGN_DTW_MAX 只在 ALIGN_MIN(8 秒) 以上的跨度上标定过；逐块延伸要判更短的
+    块（3~7 秒），那里由调用方传 min_len=3.0 并靠后面的整段复验兜住。
+    """
+    if e1 - s1 < min_len or e2 - s2 < min_len:
+        return None
+    key = (round(s1 * 1000), round(e1 * 1000), round(s2 * 1000), round(e2 * 1000))
+    if key not in DTW_CACHE:
+        DTW_CACHE[key] = dtw_dist(_span_feats(s1, e1), _span_feats(s2, e2))
+    return DTW_CACHE[key]
+
+
+def _align_ok(s1, e1, s2, e2, min_len=ALIGN_MIN):
+    """对齐通道判定：DTW 距离达标
+
+    这里**不做**包络预筛：预筛只在调用量大的地方（chunk_pair_ok）用来省时间，
+    而在延伸/跨度复验这些少量调用上它会误杀——实测 M08 尾部 4.4 秒那块同源两遍的
+    包络相关只有 0.19（两遍的内部停顿结构不同），但对齐距离 0.833（明显同源）。
+    """
+    if e1 - s1 < min_len or e2 - s2 < min_len:
+        return False
+    d = align_dist(s1, e1, s2, e2, min_len)
+    return d is not None and d <= ALIGN_DTW_MAX
+
+
+def build_env(x):
+    """10ms RMS 包络：对齐通道的便宜预筛（微秒级点积，先筛掉明显无关的候选）"""
+    m = (len(x) // ENV_FRAME) * ENV_FRAME
+    if m < ENV_FRAME * 20:
+        return np.zeros(0, dtype=np.float32)
+    return np.sqrt((x[:m].reshape(-1, ENV_FRAME) ** 2).mean(axis=1)).astype(np.float32)
+
+
+def env_of(a, b):
+    a0, b0 = max(0, int(a * 100)), int(b * 100)
+    return ENV[a0:b0] if ENV is not None and b0 - a0 > 5 else None
+
+
+def env_gate(s1, e1, s2, e2, search=False):
+    """包络相关预筛：同源 0.77~0.97、无关 ≤0.3，门限 ALIGN_ENV_GATE。
+
+    search=False（默认）按零偏移比：便宜，用于调用量最大的 chunk_pair_ok，
+    后面还有 DTW 兜着。search=True 会搜 ±ALIGN_FIRST 秒的偏移：两遍起点常因静音
+    切分差异错开（实测 M08 尾部 4.4 秒那块零偏移只有 0.19、搜到正确偏移后 0.9+），
+    用在拿它当唯一门槛的地方（anchor_pair 的边界裁定）。
+    """
+    p, q = env_of(s1, e1), env_of(s2, e2)
+    if p is None or q is None or (e1 - s1) < 2.0 or (e2 - s2) < 2.0:
+        return False
+    n = min(len(p), len(q))
+    if n < 20:
+        return False
+    p = p[:n]
+    q = q[:n]
+    p = p - p.mean()
+    q = q - q.mean()
+    npn = float(np.sqrt((p * p).mean()))
+    if npn < 1e-9:
+        return False
+    if not search:
+        d = float(np.sqrt((p * p).mean() * (q * q).mean()))
+        return d > 0 and float((p * q).mean() / d) >= ALIGN_ENV_GATE
+    lim = int(ALIGN_FIRST * 100)
+    step = max(1, int(ALIGN_ENV_STEP * 100))
+    best = -1.0
+    for k in range(-lim, lim + 1, step):
+        if k >= 0:
+            a, b = p[k:], q[:n - k]
+        else:
+            a, b = p[:n + k], q[-k:]
+        if len(a) < 20:
+            continue
+        nq = float(np.sqrt((b * b).mean()))
+        if nq > 1e-9:
+            v = float((a * b).mean() / (npn * nq))
+            if v > best:
+                best = v
+    return best >= ALIGN_ENV_GATE
+
+
+def align_span_resid(x, s1, e1, s2, e2):
+    """整段的「短窗对齐残差」（带缓存）——align 段的最终裁定口径。
+
+    为什么不拿 DTW 距离裁定边界：DTW 自带 ±10% 的弯折余量，多切进来一小段内容也能
+    挤进去（实测 单元检测卷（5）D07 头部多吞 17.8 秒、报数 0.038 崩到 1.31）。
+    短窗残差是在对齐后的正确偏移上逐 0.1 秒比波形，多带的内容立刻暴露：
+    实测同源对齐段 0.09~0.93、多带或无关 1.1~1.4。
+    """
+    key = (round(s1 * 1000), round(e1 * 1000), round(s2 * 1000), round(e2 * 1000))
+    if key in SPAN_RESID_CACHE:
+        return SPAN_RESID_CACHE[key]
+    lag, _ = find_lag(x, s1, e1, s2, e2)
+    offs = align_offsets(x, s1, e1, s2, e2, lag)
+    r = slice_resid_warp(x, s1, e1, lag_func(offs)) if offs else None
+    SPAN_RESID_CACHE[key] = r
+    return r
+
+
+def align_offsets(x, s1, e1, s2, e2, lag=None):
+    """分段局部偏移 [(t, offset秒), ...]：每 ALIGN_BLOCK 秒定一次两遍的偏移。
+
+    先用帧级特征找（特征平滑、没有音高周期歧义），再在波形上精修 ±ALIGN_FINE 秒：
+    特征只有 20ms 精度，撑不起波形残差。首块 ±ALIGN_FIRST 宽搜（两遍起点可能错开
+    1 秒以上），之后跟上一块 ±ALIGN_FOLLOW 走（实测抖动量级 ±0.12 秒）。
+    """
+    A, B = _span_feats(s1, e1), _span_feats(s2, e2)
+    if A is None or B is None:
+        return None
+    key = (round(s1 * 1000), round(e1 * 1000), round(s2 * 1000), round(e2 * 1000))
+    if key in OFFSET_CACHE:
+        return OFFSET_CACHE[key]
+    step = max(2, int(ALIGN_BLOCK * SR / ALIGN_HOP))
+    n, m = len(A), len(B)
+    cur = 0 if lag is None else int(round((lag - (s2 - s1)) * SR / ALIGN_HOP))
+    rough, first = [], True
+    for p in range(0, max(0, n - step), step):
+        half = int((ALIGN_FIRST if first else ALIGN_FOLLOW) * SR / ALIGN_HOP)
+        best, bk = None, None
+        for k in range(cur - half, cur + half + 1):
+            q = p + k
+            if q < 0 or q + step > m:
+                continue
+            d = float(((A[p:p + step] - B[q:q + step]) ** 2).sum())
+            if best is None or d < best:
+                best, bk = d, k
+        first = False
+        if bk is None:
+            continue
+        cur = bk
+        rough.append((p, bk))
+    if not rough:
+        return None
+    out = _refine_offsets(x, s1, s2, e1, rough, int(ALIGN_BLOCK * SR))
+    if out:
+        OFFSET_CACHE[key] = out
+    return out or None
+
+
+def _refine_offsets(x, s1, s2, e1, rough, win):
+    """20ms 精度的偏移再在波形上精修到 1 个采样（±ALIGN_FINE 秒内取残差最小）"""
+    i0, j0 = int(round(s1 * SR)), int(round(s2 * SR))
+    n = int(round((e1 - s1) * SR))
+    fine = int(ALIGN_FINE * SR)
+    out = []
+    for p, k in rough:
+        a0, a1 = p * ALIGN_HOP, min(n, p * ALIGN_HOP + win)
+        if a1 - a0 < SR // 5:
+            continue
+        a = x[i0 + a0:i0 + a1]
+        b0 = j0 + a0 + k * ALIGN_HOP
+        best, bl = None, k * ALIGN_HOP
+        for d in range(-fine, fine + 1):
+            if b0 + d < 0 or b0 + d + len(a) > len(x):
+                continue
+            v = float(((a - x[b0 + d:b0 + d + len(a)]) ** 2).mean())
+            if best is None or v < best:
+                best, bl = v, k * ALIGN_HOP + d
+        out.append((s1 + a0 / SR, (s2 - s1) + bl / SR))
+    return out
+
+
+def lag_func(offs):
+    """把分段偏移压成查表函数 t -> offset(秒)；超出范围按最近端点取值
+
+    偏移是**绝对**口径（第二遍时刻 − 第一遍时刻），与 slice_resid / lag 的约定一致。
+    """
+    ts = [t for t, _ in offs]
+    vs = [v for _, v in offs]
+
+    def f(t):
+        if t <= ts[0]:
+            return vs[0]
+        if t >= ts[-1]:
+            return vs[-1]
+        return vs[min(int(np.searchsorted(ts, t)), len(vs) - 1)]
+    return f
+
+
+def slice_resid_warp(x, s, e, lagf, win=0.1):
+    """沿分段偏移对齐后的残差（短窗口径）。
+
+    这批制品的两遍只在很短的时间尺度上逐采样一致：0.1 秒窗内相关中位 0.79，
+    1 秒窗就已经散掉（实测 1 秒窗残差 1.1~1.5，跟无关内容差不多）。所以对齐段
+    不能用 0.5~1 秒的窗口去比，得按 win 秒（默认 0.1 秒）一块、每块在 lagf 给出的
+    偏移附近再搜 ±ALIGN_FINE 秒取最小残差，再按能量合并。单位与 slice_resid 一致，
+    报数仍走 match_pct（实测同源两遍 0.35~0.60、无关内容 1.1~1.4）。
+    """
+    n = int(round((e - s) * SR))
+    w = max(int(win * SR), SR // 10)
+    if n < w:
+        return None
+    i0 = int(round(s * SR))
+    fine = max(1, int(ALIGN_FINE * SR))
+    err = sig = 0.0
+    for p in range(0, n - w + 1, w):
+        lg = lagf(s + (p + w / 2.0) / SR)
+        if lg is None:
+            continue
+        a = x[i0 + p:i0 + p + w]
+        b0 = i0 + p + int(round(lg * SR)) - fine
+        seg = x[b0:b0 + w + 2 * fine]
+        if b0 < 0 or len(seg) < w + 2 * fine:
+            continue
+        cc = np.correlate(seg - seg.mean(), a - a.mean(), 'valid')
+        ee = np.convolve(seg * seg, np.ones(w), 'valid')
+        ncc = cc / np.sqrt(np.maximum(ee * float(np.dot(a, a)), 1e-12))
+        best = seg[int(np.argmax(ncc)):][:w]
+        if len(best) < w:
+            continue
+        err += float(((a - best) ** 2).sum())
+        sig += float((a * a).sum())
+    return float(np.sqrt(err / sig)) if sig > 0 else None
+
+
 # ---------- marker (chime) discovery ----------
 
 def spectral_change(x, s, e, n_fft=512, hop=256):
@@ -172,8 +501,8 @@ def find_markers(x, chunks, min_cluster=4):
     # 实测 4 份样本：60 个真提示音的频谱变化最大值 0.0035，179 个非提示音短语的
     # 最小值 0.0174，两者零重叠。少了这一步，一段反复出现的合成播报（如
     # 「请听下面一段对话」）就可能凭互相关聚类劫持整个提示音簇，第一节边界全崩。
-    cand = [i for i, (a, b) in enumerate(chunks) if 0.6 <= b - a <= 2.5]
-    cand = [i for i in cand
+    cand_dur = [i for i, (a, b) in enumerate(chunks) if 0.6 <= b - a <= 2.5]
+    cand = [i for i in cand_dur
             if (spectral_change(x, *chunks[i]) or 1.0) <= MARKER_SPECTRAL_MAX]
     n = len(cand)
     parent = list(range(n))
@@ -211,6 +540,17 @@ def find_markers(x, chunks, min_cluster=4):
     for g in groups.values():
         if len(g) >= min_cluster:
             out.extend(g)
+    if DIAG is not None:
+        # 三个数定位「提示音没找到」卡在哪一环：
+        #   by_dur 小      → 提示音没被静音切成独立块（多半粘在播报里），本文件最大的隐患
+        #   by_spectral 小 → 频谱闸把提示音挡了（闸本身过严，或提示音不是乐音）
+        #   簇都在 min_cluster 以下 → 提示音彼此不像（聚类阈值问题）
+        DIAG["marker_n_by_dur"] = len(cand_dur)
+        DIAG["marker_n_by_spectral"] = len(cand)
+        DIAG["marker_clusters"] = [
+            {"size": len(g), "blocks": sorted(g),
+             "dur": round(chunks[g[0]][1] - chunks[g[0]][0], 3)}
+            for g in sorted(groups.values(), key=len, reverse=True)]
     return sorted(out)
 
 # ---------- repeat pair detection ----------
@@ -257,13 +597,29 @@ def chunk_pair_ok(x, chunks, ci, cj):
         return True
     _lag, r = estimate_lag(x, chunks[ci][0], chunks[ci][1],
                            chunks[cj][0], chunks[cj][1], PAIR_LAG_TOL)
-    return r is not None and r <= CHUNK_RESID
+    if r is not None and r <= CHUNK_RESID:
+        return True
+    # 波形两条都不过：试对齐通道（拼接缝/抖动/变速/重新朗读的制品只能靠它）。
+    # 顺序很重要——波形判得通就完全不碰 DTW，现有制品的结论与耗时因此不变。
+    # 这里先过一道便宜的包络预筛（带偏移搜索，毫秒级）：本函数调用量最大，预筛把
+    # 明显无关的候选挡掉；偏移必须搜——两遍的块起点常因静音切分差异错开 1 秒以上，
+    # 零偏移比会把真配对误杀（实测 M08 尾部那块零偏移只有 0.19、正偏移下 0.9+）。
+    # 真伪最后由 anchor_pair 的短窗对齐残差裁定，这里宽松一点没关系。
+    if not ALIGN_ON:
+        return False        # 没开对齐通道时与 v4 逐字一致
+    s1, e1, s2, e2 = chunks[ci][0], chunks[ci][1], chunks[cj][0], chunks[cj][1]
+    if env_gate(s1, e1, s2, e2, search=True) and _align_ok(s1, e1, s2, e2, min_len=2.0):
+        return True
+    return False
 
 
 def find_repeat_pairs(x, chunks, min_chunks=2, min_total=3.0, marker_set=()):
     n = len(chunks)
     durs = [b - a for a, b in chunks]
 
+    if DIAG is not None:
+        DIAG["pair_cands"] = []
+        DIAG["pair_n_reject_short"] = 0
     cands = []
     for i in range(n):
         for j in range(i + 1, n):
@@ -277,11 +633,26 @@ def find_repeat_pairs(x, chunks, min_chunks=2, min_total=3.0, marker_set=()):
             # internal silence is one chunk per play)
             if tot >= min_total and (len(pr) >= min_chunks or (len(pr) == 1 and tot >= 8.0)):
                 cands.append((i, j, pr))
+            elif DIAG is not None:
+                # 时长链接上了但太短，够不上一段材料。这个数本身就是「块被切碎」的信号。
+                DIAG["pair_n_reject_short"] += 1
     cands.sort(key=lambda m: -sum(durs[c] for c, _ in m[2]))
+    if DIAG is not None:
+        DIAG["pair_n_cands"] = len(cands)
     used = set()
     confirmed, soft = [], []
-    for i, j, pr in cands:
+    for _k, (i, j, pr) in enumerate(cands):
+        # 诊断只记排在最前面的若干条（按总长降序）：被采用的一定在前面，
+        # 挤在后面的几百条「提示音互相配对」记下来只会淹没真正有用的那几条。
+        rec = None
+        if DIAG is not None and _k < DIAG_CAND_MAX:
+            rec = {"i": i, "j": j, "blocks": len(pr),
+                   "total": round(sum(durs[c] for c, _ in pr), 3),
+                   "t1": round(chunks[i][0], 3), "t2": round(chunks[j][0], 3)}
+            DIAG["pair_cands"].append(rec)
         if any(t in used for t in (c for pr_ in pr for c in pr_)):
+            if rec is not None:
+                rec["reason"] = "chunks_used"
             continue
         # 证据里的提示音必须剔除：提示音是同一段录音被反复播放，互相关天然接近 1.0。
         # 潍坊卷有一段假配对（主体 "#29 vs #35" 相关只有 0.015），靠两个提示音
@@ -290,12 +661,20 @@ def find_repeat_pairs(x, chunks, min_chunks=2, min_total=3.0, marker_set=()):
         ev = [(durs[ci], ci, cj) for ci, cj in pr
               if ci not in marker_set and cj not in marker_set]
         if not ev:
+            if rec is not None:
+                # 整条时长链的证据全是提示音：这是「提示音劫持配对」的确证，
+                # 也是把两道不同的题缝成一段的常见成因。
+                rec["reason"] = "marker_only"
             continue
         ev.sort(reverse=True)
+        if rec is not None:
+            rec["n_ev"] = len(ev)
         ok = chunk_pair_ok(x, chunks, ev[0][1], ev[0][2])
         if not ok:
             ok = sum(1 for _, ci, cj in ev[:5] if chunk_pair_ok(x, chunks, ci, cj)) >= 2
         if not ok:
+            if rec is not None:
+                rec["reason"] = "no_wave_evidence"
             continue
         # 上面只是单块粗筛（便宜）。时长链提出的边界常常吞进了提示音/题目指引，
         # 单块相关度照样很高，必须再用整段对齐精筛一次，否则会切出一段
@@ -308,8 +687,13 @@ def find_repeat_pairs(x, chunks, min_chunks=2, min_total=3.0, marker_set=()):
             # 听一下，不能悄悄丢掉（丢了整份卷就少一段）。
             soft.append(_trim_markers(chunks, i, pr[-1][0] + 1, j, pr[-1][1] + 1,
                                       marker_set))
+            if rec is not None:
+                rec["reason"] = "anchor_failed(soft)"
             continue
         a, c, b, d = anc
+        if rec is not None:
+            rec["reason"] = "kept"
+            rec["kept"] = [a, c, b, d]
         used.update(range(a, b))
         used.update(range(c, d))
         confirmed.append((a, c, b, d))
@@ -413,7 +797,7 @@ def rescue_pairs(x, chunks, marker_set, pairs, min_total=8.0):
             break
     return out
 
-def _match_runs(x, chunks, ci, cj):
+def _match_runs(x, chunks, ci, cj, allow_align=False):
     """find (m, k) such that chunks[ci:ci+m] and chunks[cj:cj+k] are the same
     recording (tolerates silence-split differences: 1 chunk vs several)"""
     for m, k in ((1, 1), (1, 2), (2, 1), (1, 3), (3, 1), (2, 2)):
@@ -425,6 +809,19 @@ def _match_runs(x, chunks, ci, cj):
             continue
         if xcorr_best(seg(x, a0, a1), seg(x, b0, b1)) > 0.75:
             return m, k
+    if not allow_align:
+        return None      # copy 段只认波形，行为与原来完全一致
+    # 波形对不上：试对齐通道。这里放宽时长差（长材料两遍的静音切分可能差 1 秒以上），
+    # 判据交给对齐距离，误伸由 extend_pair_ends 的整段复验兜住。
+    for m, k in ((1, 1), (2, 1), (1, 2), (3, 1), (1, 3), (2, 2), (3, 2), (2, 3)):
+        if ci + m > len(chunks) or cj + k > len(chunks):
+            continue
+        a0, a1 = chunks[ci][0], chunks[ci + m - 1][1]
+        b0, b1 = chunks[cj][0], chunks[cj + k - 1][1]
+        if abs((a1 - a0) - (b1 - b0)) > max(0.6, 0.06 * max(a1 - a0, b1 - b0)):
+            continue
+        if _align_ok(a0, a1, b0, b1, min_len=3.0):
+            return m, k
     return None
 
 def extend_pair_ends(x, chunks, marker_set, pairs, max_rounds=4):
@@ -432,6 +829,10 @@ def extend_pair_ends(x, chunks, marker_set, pairs, max_rounds=4):
     guards: no markers, gap <= 2s on both sides, p1 stays before p2"""
     out = []
     for i1, j1, i2, j2 in pairs:
+        # 通道按测量决定（不记账）：波形整段残差达标就是 copy，否则走对齐通道
+        _, r0 = find_lag(x, chunks[i1][0], chunks[i2 - 1][1],
+                         chunks[j1][0], chunks[j2 - 1][1])
+        align = r0 is None or r0 > RESID_OK
         # forward
         for _ in range(max_rounds):
             if i2 >= j1 or j2 >= len(chunks) or i2 in marker_set or j2 in marker_set:
@@ -439,21 +840,38 @@ def extend_pair_ends(x, chunks, marker_set, pairs, max_rounds=4):
             if (chunks[i2][0] - chunks[i2 - 1][1] > 2.0
                     or chunks[j2][0] - chunks[j2 - 1][1] > 2.0):
                 break
-            mk_ = _match_runs(x, chunks, i2, j2)
+            mk_ = _match_runs(x, chunks, i2, j2, allow_align=ALIGN_ON and align)
             if mk_ is None or i2 + mk_[0] > j1:
                 break
+            # 对齐通道每加一块都要用整段复验（短窗对齐残差）：单块像不等于整段还是一段材料
+            # （时长链在尾部被静音切分差异截断的长材料靠这一步补全）。
+            if ALIGN_ON and align:
+                r = align_span_resid(x, chunks[i1][0], chunks[i2 + mk_[0] - 1][1],
+                                     chunks[j1][0], chunks[j2 + mk_[1] - 1][1])
+                if r is None or r > ALIGN_RESID_OK:
+                    break
             i2 += mk_[0]
             j2 += mk_[1]
         # backward
-        for _ in range(max_rounds):
+        # 对齐模式**不做**头部延伸：材料前面挨着的是「提示音 + 中文读题」，而读题两遍
+        # 是同一句话（对齐残差同样低），长回去会把读题并进材料——用户口径是只切材料本身。
+        # 实测放开后会改变 31 份老样本的跨度（最大 22 秒），收益（高一（25）那类）其实
+        # 靠 MAX_PLAY_GAP_ALIGN 就能拿到，所以这里保持收紧。
+        for _ in range(0 if (ALIGN_ON and align) else max_rounds):
             if i1 <= 0 or j1 <= 0 or i1 - 1 in marker_set or j1 - 1 in marker_set:
                 break
             if (chunks[i1][0] - chunks[i1 - 1][1] > 2.0
                     or chunks[j1][0] - chunks[j1 - 1][1] > 2.0):
                 break
-            mk_ = _match_runs(x, chunks, i1 - 1, j1 - 1)
+            mk_ = _match_runs(x, chunks, i1 - 1, j1 - 1, allow_align=align)
             if mk_ is None or j1 - mk_[1] <= i1 - mk_[0]:
                 break
+            # 与尾部同样要求：每往前加一块都用整段复验一次（短窗对齐残差）
+            if ALIGN_ON and align:
+                r = align_span_resid(x, chunks[i1 - mk_[0]][0], chunks[i1 - 1][1],
+                                     chunks[j1 - mk_[1]][0], chunks[j1 - 1][1])
+                if r is None or r > ALIGN_RESID_OK:
+                    break
             i1 -= mk_[0]
             j1 -= mk_[1]
         out.append((i1, j1, i2, j2))
@@ -495,10 +913,14 @@ OUTLIER_MIN = 0.12   # 离群判定的绝对下限：光看「比本卷中位数
                      # 两遍耳朵完全听不出区别）。加一道绝对下限：残差本身不到 0.12
                      # （≈ RESID_OK 的三分之一）一律不提醒；真有问题的段残差是 0.25~0.3，
                      # 而且另有切点核对会先报出来
+MAX_PLAY_GAP_ALIGN = 60.0   # 对齐通道（两遍时间轴有拼接/抖动）的两遍间隔上限放宽到 60 秒：
+                            # 实测这类制品同一段材料两遍之间可以隔 34~38 秒
+                            # （高一（18）38.2 秒、（25）34.4 秒），按 30 秒会把整段丢掉
 MAX_SINGLE = 26.0    # 单遍材料的最长时长(秒)，超过者为「第二节说明」之类的块
 ADAPT_SPAN = 25.0    # 语音块平均跨度超过这么多秒 → 认定静音门限太严（底噪偏高），
                      # 见 detect_silences 的实测：正常录音每块 7~14 秒
 MIN_SINGLE = 8.0     # 单遍材料的最短时长(秒)，短于此多半是切碎了（实测真材料最短 9.8 秒）
+
 SPLIT_GAP = 3.0      # 无提示音兜底时，把「答题静音」认作分界的间隔(秒)
 RESID_OK = 0.35      # 「这两遍确实是同一段」的整段残差上限（实测真配对 ≤0.31）
 FINE_WIN = 2.0       # 亚样本位移精化用的短窗(秒)。实测这个位移是全段常量（同一段
@@ -615,7 +1037,7 @@ def slice_resid(x, s, e, lag):
     return float(np.sqrt(((a - b) ** 2).mean()) / den)
 
 
-def align_pair(x, s1, e1, s2, e2, max_shift=ALIGN_SHIFT):
+def align_pair(x, s1, e1, s2, e2, max_shift=ALIGN_SHIFT, lagf=None):
     """求两遍的时间偏移，并据此量化「两遍是否一致」。
 
     ① 在 p2 附近做归一化 FFT 互相关，求出整数样本精度的 lag
@@ -639,17 +1061,27 @@ def align_pair(x, s1, e1, s2, e2, max_shift=ALIGN_SHIFT):
     if n1 < SR:
         return None
     lag, _raw = find_lag(x, s1, e1, s2, e2, max_shift)
-    if lag is None:
+    if lag is None and lagf is None:
         return None
     # 报数用亚样本对齐后的残差：find_lag 的 lag 已经含分数位移，slice_resid 会
     # 把它算进对齐里，于是同一段材料在不同解码/相位下得到同一个数（实测十段
     # 从 75~95% 收敛到 90~95%）。判据用的仍是 find_lag 的整数口径 resid。
-    resid = slice_resid(x, s1, e1, lag)
+    # lagf 非空（对齐通道）时按分段偏移逐块算，口径不变、只是 lag 随时间变。
+    if lagf is None:
+        resid = slice_resid(x, s1, e1, lag)
+    else:
+        resid = slice_resid_warp(x, s1, e1, lagf)
+        if lag is None:
+            lag = lagf((s1 + e1) / 2)
     if resid is None or resid < 1e-6:
         return resid, None, lag
     win = min(EDGE_WIN, (e1 - s1) / 4.0)
-    edges = [v for v in (slice_resid(x, s1, s1 + win, lag),
-                         slice_resid(x, e1 - win, e1, lag)) if v is not None]
+    if lagf is None:
+        edges = [v for v in (slice_resid(x, s1, s1 + win, lag),
+                             slice_resid(x, e1 - win, e1, lag)) if v is not None]
+    else:
+        edges = [v for v in (slice_resid_warp(x, s1, s1 + win, lagf),
+                             slice_resid_warp(x, e1 - win, e1, lagf)) if v is not None]
     # 两端残差本身不到 EDGE_MIN 就不算「局部抬升」：比值会骗人（见 EDGE_MIN 的实测）
     top = max(edges) if edges else None
     return resid, (top / resid if top is not None and top >= EDGE_MIN else None), lag
@@ -799,6 +1231,9 @@ def grow_bounds(x, chunks, marker_set, s, e, lag, max_grow=GROW_MAX):
     # ---- 头部 ----
     # 长完一轮再长一轮：候选窗口是跟着边界挪的（`s - max_grow` 起步），一轮只能看到
     # 12 秒内的候选；实测 临沂 D10 一轮停在 874.737，再跑一轮才够到 872.097。
+    # 注：对齐通道（align 段）根本不进这个函数——那类录音材料前面挨着「提示音 +
+    # 中文读题」，读题两遍是同一句话、对齐距离同样低，长回去会把读题并进材料，
+    # 而用户口径是只切材料本身（见 extract_materials 里的 align 分支）。
     for _round in range(8):
         before = s
         cands = [t for t, _ in chunks if s - max_grow <= t < s - 1e-9]
@@ -1007,10 +1442,22 @@ def anchor_pair(x, chunks, i1, j1, i2, j2, marker_set, span=ANCHOR_SPAN):
     span_resid_int 会按能比的长度截断着算，算出来是 0.9 这种数，假配对就拦得住了。
     """
     lag0 = chunks[j1][0] - chunks[i1][0]     # 错位只改变边界，几乎不改变两遍的间隔
-    _lag, resid = find_lag(x, chunks[i1][0], chunks[i2 - 1][1],
-                           chunks[j1][0], chunks[j2 - 1][1])
+    s1, e1 = chunks[i1][0], chunks[i2 - 1][1]
+    s2, e2 = chunks[j1][0], chunks[j2 - 1][1]
+    _lag, resid = find_lag(x, s1, e1, s2, e2)
     if resid is not None and resid <= RESID_OK:
         return i1, j1, i2, j2
+    # 顺序很重要：**先照原来的方式 reanchor**（波形能在候选邻域里找到达标跨度就照旧用），
+    # 只有它一个达标跨度都找不到（两遍时间轴被抖动过，整套刚性判据全废）时，才退回
+    # 对齐通道、原样保留候选跨度。这样：
+    #   · 波形判得动的样本（绝大多数老卷子）走的分支、结果与 v4 逐字一致；
+    #   · 抖动型样本（高一 29 份）reanchor 必然返回 None，由对齐通道接手，交给下游逐块延伸。
+    # 裁定对齐用**短窗对齐残差**而不是 DTW 距离：DTW 自带 ±10% 弯折余量，多切进来的
+    # 内容也能挤进去（实测 单元检测卷（5）D07 头部多吞 17.8 秒）。
+    if ALIGN_ON and env_gate(s1, e1, s2, e2, search=True):
+        r = align_span_resid(x, s1, e1, s2, e2)
+        if r is not None and r <= ALIGN_RESID_OK:
+            return i1, j1, i2, j2
     return reanchor(x, chunks, i1, j1, i2, j2, lag0, marker_set, span)
 
 
@@ -1075,7 +1522,15 @@ def extract_materials(x, chunks, markers, pairs):
     for i1, j1, i2, j2 in pairs:
         gap = chunks[j1][0] - chunks[i2 - 1][1]
         total = chunks[i2 - 1][1] - chunks[i1][0]
-        if gap <= MAX_PLAY_GAP and total >= MIN_PAIR_SPEECH:
+        # 两遍间隔的上限按通道取值：波形对得上的（copy）沿用 30 秒；靠对齐通道确认的
+        # （两遍时间轴有拼接/抖动，内容已用 DTW 核过）放宽到 60 秒，否则整段会被丢掉
+        # （实测高一（18）38.2 秒、（25）34.4 秒那两段就是这么丢的）。
+        _, r0 = find_lag(x, chunks[i1][0], chunks[i2 - 1][1],
+                         chunks[j1][0], chunks[j2 - 1][1])
+        gap_lim = MAX_PLAY_GAP if (r0 is not None and r0 <= RESID_OK) else MAX_PLAY_GAP_ALIGN
+        if not ALIGN_ON:
+            gap_lim = MAX_PLAY_GAP          # 没开对齐通道时与 v4 逐字一致
+        if gap <= gap_lim and total >= MIN_PAIR_SPEECH:
             mat_pairs.append((i1, j1, i2, j2, gap))
         else:
             disc.append((i1, j1, i2, j2, gap))
@@ -1089,9 +1544,28 @@ def extract_materials(x, chunks, markers, pairs):
             pair_zone.add(t)
         s = chunks[i1][0]
         e = chunks[i2 - 1][1]
-        lag, _ = find_lag(x, s, e, chunks[j1][0], chunks[j2 - 1][1])
-        if lag is None:
-            al = align_pair(x, s, e, chunks[j1][0], chunks[j2 - 1][1])
+        s2_, e2_ = chunks[j1][0], chunks[j2 - 1][1]
+        # 通道由测量决定，不靠记账：波形整段残差达标就是 copy（口径与行为照旧），
+        # 判不过才建分段偏移、走对齐通道。这样「哪些段该换口径」永远跟手上这段
+        # 音频的实际测量一致，不会因为上游怎么确认的而错配。
+        lag, resid0 = find_lag(x, s, e, s2_, e2_)
+        lagf = None
+        if ALIGN_ON and (resid0 is None or resid0 > RESID_OK):
+            offs = align_offsets(x, s, e, s2_, e2_, lag)
+            if offs:
+                lagf = lag_func(offs)
+        chan = "align" if lagf is not None else "copy"
+        ok_resid = ALIGN_RESID_OK if lagf is not None else RESID_OK
+        lg = lag if lag is not None else 0.0
+        if lagf is not None:
+            # 对齐段：不做两头修剪/生长。判据（1 秒窗的波形残差）在这类录音上本来就
+            # 失效——它们的波形只在 0.1 秒尺度上一致，1 秒窗残差 1.1~1.5，修剪会
+            # 把整段材料当「不像材料」一路剪掉（实测 M01 被剪掉开头 3.5 秒、
+            # M09 被剪到只剩 19.8 秒）。边界就信时长链给的跨度 + 尾部的逐块延伸，
+            # 那正是用户口径「靠两遍时长结构严格一致定位、把中文读题排除在外」。
+            al = align_pair(x, s, e, s2_, e2_, lagf=lagf)
+        elif lag is None:
+            al = align_pair(x, s, e, s2_, e2_)
         else:
             # 先把不属于材料的两头剪掉（提示音、题目指引、只在一遍里出现的内容），
             # 再按波形往外长 —— 只长不剪的话，时长链吞进来的那两秒会一直留在材料里。
@@ -1099,14 +1573,14 @@ def extract_materials(x, chunks, markers, pairs):
             # 生长把起止点往外挪了 Δ，第二遍的窗口得跟着挪同样的量：否则 align_pair
             # 在 chunks[j1][0] ±2 秒里搜不到真的第二遍（D04 差了 4.6 秒）
             gs, ge = grow_bounds(x, chunks, marker_set, s, e, lag)
-            al_g = align_pair(x, gs, ge, gs + lag, ge + lag) if (gs, ge) != (s, e) else None
+            al_g = align_pair(x, gs, ge, gs + lg, ge + lg) if (gs, ge) != (s, e) else None
             # 长完必须整段仍然对得上，否则只说明「扩进来那一小段碰巧吻合」，一律回退：
             # 实测 17-标速(美音2) D06 尾部误长 9.45 秒，报数从 0.040 崩到 1.364；
             # 另有 3 份长到文件尾，第二遍窗口不够长，直接报「找不到第二遍」。
             if al_g is not None and al_g[0] is not None and al_g[0] <= RESID_OK:
                 s, e, al = gs, ge, al_g
             else:
-                al = align_pair(x, s, e, s + lag, e + lag)
+                al = align_pair(x, s, e, s + lg, e + lg)
         if al is None:
             notes.append((chunks[i1][0],
                           f"跳过 {chunks[i1][0]:.3f} 秒处这一段："
@@ -1115,19 +1589,23 @@ def extract_materials(x, chunks, markers, pairs):
         else:
             resid, ratio, lag2 = al
         # resid_raw = 只按整数样本对齐的残差，留着对照：它比 resid 虚高 2~4 倍，
-        # 正好说明亚样本精化在干什么（也写进 timeline.json）
-        raw = None if lag2 is None else slice_resid(x, s, e, round(lag2 * SR) / SR)
+        # 正好说明亚样本精化在干什么（也写进 timeline.json）。
+        # 对齐段不记：那里单一 lag 本身就是错的，这个数没有可比性。
+        raw = (None if (lag2 is None or lagf is not None)
+               else slice_resid(x, s, e, round(lag2 * SR) / SR))
         # 报数取「亚样本对齐」与「整数对齐」里更好的那一个：分数位移是在短窗上估的，
         # 对整段未必最优（实测 20 段反而略差，且都在 40% 以下本来就可疑的段上）。
         # 取 min 让「换口径以后报数只会变好」这条性质严格成立。
         if raw is not None and resid is not None:
             resid = min(resid, raw)
+        # 对齐段不做切点核对：那里的判据是 1 秒窗的波形残差，而这类录音的波形只在
+        # 0.1 秒尺度上一致（内侧 0.5~0.99、外侧 1.1~1.4，挨得太近），报出来多是噪声。
         check = (boundary_check(x, chunks, marker_set, s, e, lag2)
-                 if lag2 is not None else (None,) * 4)
+                 if lag2 is not None and lagf is None else (None,) * 4)
         flag = ""
         if resid is None:
             flag = "找不到这一段的第二遍，无法自动校验，请人工听一下"
-        elif resid > RESID_OK:
+        elif resid > ok_resid:
             # 两遍对不上时 lag 本身就不可靠，切点核对的那些数字没有意义，只报这一条
             flag = (f"这两遍的波形对不上（吻合度 {match_pct(resid):.0f}%）：多半是"
                     f"录音方把这段重新读了一遍，而不是复制同一段录音，请人工听一下")
@@ -1135,12 +1613,13 @@ def extract_materials(x, chunks, markers, pairs):
             flag = ("这一段的开头或结尾可能多带了不该有的内容"
                     "（两端和中间不像同一段），请人工听一下")
         # 两遍本身对不上时 lag 就是错的，切点核对的数字只是噪声，别再叠一条
-        if resid is None or resid <= RESID_OK:
+        if resid is None or resid <= ok_resid:
             bad = boundary_complaint(check)
             if bad:
                 flag = f"{flag}；{bad}" if flag else bad
         materials.append({"start": s, "end": e, "plays": 2, "flag": flag,
                           "resid": resid, "resid_raw": raw, "check": check,
+                          "channel": chan,
                           "lag": lag if lag is not None else None})
 
     # 只有「两遍真的对得上」的材料才当第一节的终点：一段没通过校验的材料（比如被
@@ -1170,7 +1649,8 @@ def extract_materials(x, chunks, markers, pairs):
                 break
             c += 1
         if e - s >= 2.0 and not glued:
-            candidates.append({"start": s, "end": e, "plays": 1, "flag": ""})
+            candidates.append({"start": s, "end": e, "plays": 1, "flag": "",
+                               "channel": "copy"})
 
     kept, after = [], []
     for cd in candidates:
@@ -1239,7 +1719,8 @@ def extract_materials(x, chunks, markers, pairs):
 
         if len(blocks) == N_SINGLE:
             kept = [{"start": chunks[b[0]][0], "end": chunks[b[-1]][1],
-                     "plays": 1, "flag": "", "fallback": True} for b in blocks]
+                     "plays": 1, "flag": "", "channel": "copy", "fallback": True}
+                    for b in blocks]
             notes.append((0.0, f"提示音没能定位第一节，改用「答题静音」兜底："
                                f"第一个双遍材料之前正好切出 {N_SINGLE} 块"))
         # 切不出 N_SINGLE 块不是异常：第一节也播两遍的录音本来就没有单遍材料可找。
@@ -1258,13 +1739,16 @@ def extract_materials(x, chunks, markers, pairs):
 
     # 残差绝对值本身不代表切错了（它首先反映这份录音的两遍复制质量，各卷差 10 倍以上），
     # 但【同一份卷子里明显高于其它段】是个值得人听一下的信号，故按卷内中位数做离群判定。
-    rs = sorted(m["resid"] for m in materials if m.get("resid") is not None)
+    # 只拿 copy 段比（align 段是另一把尺子：短窗残差天生 0.1~0.9，混进来会把整卷
+    # 中位数抬起来、也会把正常的 copy 段判成离群）
+    rs = sorted(m["resid"] for m in materials
+                if m.get("resid") is not None and m.get("channel") != "align")
     if len(rs) >= 3:
         med = rs[len(rs) // 2]
         if med > 1e-6:
             for mt in materials:
                 r = mt.get("resid")
-                if (r is not None and r > OUTLIER_MIN
+                if (r is not None and mt.get("channel") != "align" and r > OUTLIER_MIN
                         and r > OUTLIER_RESID * med and not mt["flag"]):
                     mt["flag"] = (f"这一段的吻合度（{match_pct(r):.0f}%）明显低于"
                                   f"本卷其它段落（其它段普遍 {match_pct(med):.0f}%）。"
@@ -1276,6 +1760,108 @@ def extract_materials(x, chunks, markers, pairs):
         mt["n"] = i
     # 提示按时间先后排序输出，方便顺着音频往下看
     return materials, mat_pairs, disc, labels, [t for _, t in sorted(notes)]
+
+# ---------- 底噪估计与覆盖度自检 ----------
+
+def estimate_noise_db(x, sr=SR, frame=SR // 50):
+    """估计这份录音的底噪（dB）。
+
+    取帧 RMS 的 10% 分位，而不是全卷最小值：最小帧可能落在任一处恰好全零的采样上，
+    没有代表性；而整卷里静音/底噪的占比远高于 10%，所以 10% 分位稳稳落在底噪区间内。
+    """
+    m = (len(x) // frame) * frame
+    if m <= 0:
+        return -60.0
+    fr = x[:m].reshape(-1, frame)
+    rms = np.sqrt((fr * fr).mean(axis=1))
+    return float(20.0 * np.log10(max(float(np.percentile(rms, 10)), 1e-6)))
+
+
+def coverage_check(chunks, materials, pairs=(), min_gap=2.0):
+    """整卷里「有人声、却没被任何一段材料覆盖」的区间，返回 [(起, 止, 时长)]。
+
+    【为什么需要它】「少切一段」以前只能等老师来报：程序自己没有一把尺子能看见
+    「这一段本该有材料却空着」。而漏段最常见的后果就是一大片人声没被任何材料吃进去，
+    这在时间轴上是一眼可见的，不用听就能算出来。
+
+    【覆盖 = 材料的每一遍，不只是切出来的那一遍】成品只留第一遍，所以第二遍天然
+    「没被切进任何一段」——不把它算作已覆盖的话，每份卷子的第二节都会整节报警。
+
+    排除三处**本来就不该**被材料覆盖的，否则每份卷子都会报：
+      · 第一段材料之前 —— 开场说明；
+      · 最后一段材料之后 —— 收尾；
+      · 第一个双遍材料紧前面那一整片 —— 第二节说明（旧规则卷里它就夹在第一、二节之间）。
+    其余落在两段材料之间的长条，才可能是漏掉的一段材料。
+
+    相邻块按小停顿合并：同一段播报常被静音切成好几块，分开看都不到一段材料的长度。
+    """
+    spans = sorted([(m["start"], m["end"]) for m in materials]
+                   + [(chunks[j1][0], chunks[j2 - 1][1])
+                      for _i1, j1, _i2, j2, _gap in pairs])
+    if not spans:
+        return []
+    first_pair = min((m["start"] for m in materials if m["plays"] == 2),
+                     default=spans[0][0])
+    lo = spans[0][0]
+    hi = max(e for _, e in spans)
+    holes = []
+    for a, b in chunks:
+        cur = a
+        for s, e in spans:
+            if s >= b:
+                break
+            if e <= cur:
+                continue
+            if s > cur:
+                holes.append([cur, min(s, b)])
+            cur = max(cur, e)
+            if cur >= b:
+                break
+        if cur < b:
+            holes.append([cur, b])
+    merged = []
+    for a, b in holes:
+        if merged and a - merged[-1][1] <= min_gap:
+            merged[-1][1] = b
+        else:
+            merged.append([a, b])
+    keep = [(a, b) for a, b in merged if a >= lo - 1e-9 and b <= hi + 1e-9]
+    # 第一个双遍材料之前那一堆没覆盖的片里，最长的就是「第二节说明」（通常 30~45 秒，
+    # 远长于夹在材料之间的答题提示），删掉它。注意不是删「最后一片」——紧挨着第一个
+    # 双遍材料的往往是一声提示音或一句播报，删它就会把真正的第二节说明漏在结果里。
+    pre = [k for k, (a, b) in enumerate(keep) if b <= first_pair + 1e-9]
+    if pre:
+        del keep[max(pre, key=lambda k: keep[k][1] - keep[k][0])]
+    return [(a, b, b - a) for a, b in keep]
+
+
+def coverage_alerts(unc, materials, want, min_dur=MIN_SINGLE):
+    """挑出「可能是漏了一段材料」的空洞。
+
+    【只在段数确实少了的时候才报】这是个教训：每段材料后面本来就跟着一段题目
+    播报/答题提示（十几到二十几秒，本来就不属于材料），所以「有人声却不属于
+    任何材料」本身根本不是异常信号，反倒磅礴每份正常卷子都会有几处。
+    试过的两条错路，都别再走：
+      · 按固定秒数卡：111 份已经切对的样本里 107 份会每段后面都报警一次；
+      · 按本卷空洞长度的中位数倍数卡：同一份卷子里题目播报的长度本来就有大有小
+        （第一节每题后约 5 秒、第二节读题时间更长），比值照样误伤正常卷子。
+    真正可靠的信号只有一个：**这份卷子的段数不够**。段数够了还报，只是给人添乱。
+    段数不够时，报最长的那几条（几条 = 少了几段），由人去听。
+    """
+    short = want - len(materials)
+    if short <= 0 or not unc:
+        return []
+    top = sorted(unc, key=lambda u: -u[2])[:short]
+    return [u for u in top if u[2] >= min_dur]
+
+
+def _prev_material(materials, t):
+    """时刻 t 之前最近的一段材料的编号（用来把可疑区间说成「在 D? 之后」）"""
+    n = ""
+    for mt in materials:
+        if mt["end"] <= t + 1e-9:
+            n = mt["n"]
+    return n
 
 # ---------- cut ----------
 
@@ -1316,14 +1902,77 @@ def describe_structure(n_single, n_double):
     return f"{n_single} 段播一遍 + {n_double} 段播两遍"
 
 
-def process(path, outdir):
-    x = decode_all(path)
-    dur = len(x) / SR
+def prepare_file(x):
+    """换一份音频时的初始化：帧级特征 + 10ms 包络各算一次（约 0.1 秒），清空对齐缓存。
+
+    必须在分析一份新音频之前调用（process() 已调用）。.kilo/dev-tools 里的诊断/回归
+    脚本走的是同一套函数，也要调它，否则查表拿不到特征 → 对齐通道会静默失效、
+    症状是「老版本的结果原样复现」，很难查。
+    """
+    global FEATS, ENV
+    FEATS, ENV = build_feats(x), build_env(x)
+    DTW_CACHE.clear()
+    OFFSET_CACHE.clear()
+    SPAN_RESID_CACHE.clear()
+
+
+def analyze_materials(x, dur):
+    """先按波形通道跑一遍；**一条配对都找不到**时，才开对齐通道再跑一遍。
+
+    闸门取得这么死，是为了守住「不影响以前已经不错的结果」：波形通道只要还能配出
+    哪怕一对，整份文件就走与 v4 逐字一致的路径，结果与耗时都不变。已知代价：济南
+    高三卷那种「波形通道切得出 10 段、但某一段少 24 秒」的情况不在闸门内（它的配对数
+    不是 0），需要用户拍板是否放宽闸门——放宽会让 22 份「标速」样本的边界跟着动。
+    """
+    global ALIGN_ON
+    ALIGN_ON = False
     chunks = build_chunks(detect_silences(x), dur)
     markers = find_markers(x, chunks)
     pairs = find_repeat_pairs(x, chunks, marker_set=set(markers))
-    materials, mat_pairs, disc, labels, notes = extract_materials(x, chunks, markers, pairs)
+    mats, mp, disc, labels, notes = extract_materials(x, chunks, markers, pairs)
+    if pairs:
+        return chunks, markers, mats, pairs, mp, disc, labels, notes
+    ALIGN_ON = True
+    DTW_CACHE.clear()
+    OFFSET_CACHE.clear()
+    SPAN_RESID_CACHE.clear()
+    chunks = build_chunks(detect_silences(x), dur)
+    markers = find_markers(x, chunks)
+    pairs = find_repeat_pairs(x, chunks, marker_set=set(markers))
+    mats, mp, disc, labels, notes = extract_materials(x, chunks, markers, pairs)
+    return chunks, markers, mats, pairs, mp, disc, labels, notes
 
+
+def process(path, outdir):
+    x = decode_all(path)
+    dur = len(x) / SR
+    if DIAG is not None:
+        # 必须先清空并建好壳：find_markers / find_repeat_pairs 在 analyze_materials
+        # 内部就会往里写，晚一步那些记录就全丢了。
+        DIAG.clear()
+        DIAG["source"] = os.path.basename(path)
+        DIAG["env"] = {"duration": round(dur, 3)}
+    prepare_file(x)
+    chunks, markers, materials, pairs, mat_pairs, disc, labels, notes = analyze_materials(x, dur)
+    # 覆盖度自检：整卷里「有人声却没被任何材料吃进去」的长条，就是漏段最直白的证据
+    uncovered = coverage_check(chunks, materials, mat_pairs)
+    if DIAG is not None:
+        DIAG["env"].update({"noise_db": round(estimate_noise_db(x), 1),
+                            "n_chunks": len(chunks),
+                            "avg_span": round(dur / max(len(chunks), 1), 2),
+                            "align_on": bool(ALIGN_ON)})
+        DIAG["chunks"] = [
+            {"i": i, "s": round(a, 3), "dur": round(b - a, 3),
+             "rms": round(float(np.sqrt((x[int(a * SR):int(b * SR)] ** 2).mean())), 4)
+             if b - a >= 0.01 else 0.0}
+            for i, (a, b) in enumerate(chunks)]
+        DIAG["markers"] = list(markers)
+        DIAG["materials"] = [{"n": m["n"], "s": round(m["start"], 3), "e": round(m["end"], 3),
+                              "plays": m["plays"], "channel": m.get("channel", "copy"),
+                              "resid": m.get("resid"), "flag": m["flag"]}
+                             for m in materials]
+        DIAG["uncovered"] = [{"s": round(a, 3), "e": round(b, 3), "dur": round(d, 3)}
+                             for a, b, d in uncovered]
     n_single = sum(1 for m in materials if m["plays"] == 1)
     n_double = sum(1 for m in materials if m["plays"] == 2)
     print(f"  找到 {len(materials)} 段材料：{describe_structure(n_single, n_double)}")
@@ -1348,6 +1997,10 @@ def process(path, outdir):
         print(f"    D{mt['n']:02d}  {mt['start']:7.3f} 秒 ~ {mt['end']:7.3f} 秒"
               f"（共 {mt['end'] - mt['start']:.3f} 秒，"
               f"播{'两' if mt['plays'] == 2 else '一'}遍）{extra}")
+    n_align = sum(1 for mt in materials if mt.get("channel") == "align")
+    if n_align:
+        print(f"    · 这份录音两次播放之间有拼接或时间轴抖动（{n_align} 段），"
+              f"已按对齐路径校验（每段局部偏移逐块对齐）")
     # 切点核对汇总：这是不看「两遍吻合」百分比的独立检查 —— 内侧应吻合（确实是材料）、
     # 外侧应不吻合（外面不是材料）。旧版 D02/D04 那种「开头被切掉」在这里会露馅。
     chk = [mt for mt in materials if mt.get("check")]
@@ -1365,6 +2018,12 @@ def process(path, outdir):
     for mt in materials:
         if mt["flag"]:
             print(f"    !! 请留意 D{mt['n']:02d}：{mt['flag']}")
+    for a, b, d in coverage_alerts(uncovered, materials, N_SINGLE + N_DOUBLE):
+        nm = _prev_material(materials, a)
+        # 段数不够时报，段数够了就不报：见 coverage_alerts 的说明
+        where = f"在 D{nm:02d} 之后" if nm else "在第一段材料之前"
+        print(f"    !! {a:.3f}~{b:.3f} 秒有 {d:.3f} 秒连续的人声没被切进任何一段"
+              f"（{where}），可能漏了一段材料，请人工听一下")
     if len(materials) < N_SINGLE + N_DOUBLE:
         print(f"    !! 注意：这份录音只找到 {len(materials)} 段，"
               f"高考听力标准是 {N_SINGLE + N_DOUBLE} 段，可能有材料没找到，请人工核对")
@@ -1376,6 +2035,9 @@ def process(path, outdir):
     timeline = {
         "materials": {str(i): {"start": round(mt["start"], 3), "end": round(mt["end"], 3),
                                "flag": mt["flag"],
+                               # copy = 两遍可用同一偏移对齐；align = 两遍之间有拼接/抖动，
+                               # 已按分段局部偏移校验（判据是对齐路径的平均帧距）
+                               "channel": mt.get("channel", "copy"),
                                "resid": None if mt.get("resid") is None
                                else round(mt["resid"], 3),
                                # resid 是亚样本对齐后的残差；raw 是只按整数样本对齐的
@@ -1397,10 +2059,19 @@ def process(path, outdir):
                   "diag": {"duration": round(dur, 3), "chunks": len(chunks),
                            "markers": len(markers), "pairs_raw": len(pairs),
                            "pairs_kept": len(mat_pairs), "pairs_dropped": len(disc),
-                           "labels": len(labels), "notes": notes}},
+                           "labels": len(labels), "uncovered": len(uncovered),
+                           "align_on": bool(ALIGN_ON), "notes": notes}},
     }
     with open(os.path.join(outdir, "timeline.json"), "w", encoding="utf-8") as f:
         json.dump(timeline, f, ensure_ascii=False, indent=1)
+    if DIAG is not None:
+        dp = (os.path.join(DIAG_DIR, os.path.splitext(os.path.basename(path))[0]
+                           + ".diag.json") if DIAG_DIR
+              else os.path.join(outdir, "diag.json"))
+        os.makedirs(os.path.dirname(os.path.abspath(dp)), exist_ok=True)
+        with open(dp, "w", encoding="utf-8") as f:
+            json.dump(DIAG, f, ensure_ascii=False, indent=1)
+        print(f"    诊断信息已保存到: {dp}")
     vols = []
     for mt in materials:
         out = os.path.join(outdir, f"D{mt['n']:02d}.mp3")
@@ -1430,10 +2101,15 @@ def pause():
 
 
 def main():
-    global FF, N_SINGLE, N_DOUBLE
+    global FF, N_SINGLE, N_DOUBLE, DIAG, DIAG_DIR
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     no_pause = "--no-pause" in sys.argv
     fmt = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--format=")), None)
+    # --diag 写到切分结果文件夹里；--diag=<目录> 集中收集（批量跑时方便一次性发走）。
+    # 默认不开：老师双击跑的时候屏幕输出和以前一模一样。
+    diag_arg = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--diag=")), None)
+    if diag_arg is not None or "--diag" in sys.argv:
+        DIAG, DIAG_DIR = {}, (diag_arg or None)
     if fmt:
         try:
             a, b = fmt.split("+")
